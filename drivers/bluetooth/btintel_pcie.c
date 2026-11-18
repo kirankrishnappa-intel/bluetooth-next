@@ -4291,6 +4291,34 @@ exit_error:
 	return err;
 }
 
+/* Drain the dump workers and block new ones. A pending work that gets
+ * cancelled never runs its tail, so release the guard bit it owns.
+ * user_dump_work goes first since it can queue coredump_work.
+ */
+static void btintel_pcie_disable_dump_works(struct btintel_pcie_data *data)
+{
+	if (disable_delayed_work_sync(&data->user_dump_work))
+		clear_bit(BTINTEL_PCIE_USER_TRIGGERED_DUMP, &data->flags);
+	disable_work_sync(&data->hwexp_work);
+	if (disable_work_sync(&data->fwtrigger_work))
+		clear_bit(BTINTEL_PCIE_FWTRIGGER_DUMP_INPROGRESS, &data->flags);
+	if (disable_work_sync(&data->coredump_work))
+		clear_bit(BTINTEL_PCIE_COREDUMP_INPROGRESS, &data->flags);
+	if (disable_work_sync(&data->mbox_work)) {
+		clear_bit(BTINTEL_PCIE_MBOX_PARSE_PENDING, &data->flags);
+		clear_bit(BTINTEL_PCIE_MAIL_BOX_INTR, &data->flags);
+	}
+}
+
+static void btintel_pcie_enable_dump_works(struct btintel_pcie_data *data)
+{
+	enable_work(&data->mbox_work);
+	enable_work(&data->coredump_work);
+	enable_work(&data->fwtrigger_work);
+	enable_work(&data->hwexp_work);
+	enable_delayed_work(&data->user_dump_work);
+}
+
 static int btintel_pcie_setup(struct hci_dev *hdev)
 {
 	int err, fw_dl_retry = 0;
@@ -4309,9 +4337,16 @@ static int btintel_pcie_setup(struct hci_dev *hdev)
 		btintel_pcie_dump_debug_registers(hdev);
 		btintel_pcie_disable_interrupts(data);
 		btintel_pcie_synchronize_irqs(data);
+
+		/* Dump workers queued by the failed attempt read-modify-write
+		 * FUNC_CTRL and must not run across the reset and re-enable.
+		 */
+		btintel_pcie_disable_dump_works(data);
+
 		err = btintel_pcie_reset_bt(data);
 		if (err) {
 			bt_dev_err(hdev, "Failed to do shr reset: %d", err);
+			btintel_pcie_enable_dump_works(data);
 			break;
 		}
 		usleep_range(10000, 12000);
@@ -4319,6 +4354,7 @@ static int btintel_pcie_setup(struct hci_dev *hdev)
 		btintel_pcie_enable_interrupts(data);
 		btintel_pcie_config_msix(data);
 		err = btintel_pcie_enable_bt(data);
+		btintel_pcie_enable_dump_works(data);
 		if (err) {
 			bt_dev_err(hdev, "Failed to enable hardware: %d", err);
 			break;
